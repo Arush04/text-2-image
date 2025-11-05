@@ -47,24 +47,41 @@ class ResBlock(nn.Module):
         return r + x
 
 # Attention Block
-class Attention(nn.Module):
-    def __init__(self, C: int, num_heads:int , dropout_prob: float):
-        super().__init__()
-        self.proj1 = nn.Linear(C, C*3)
-        self.proj2 = nn.Linear(C, C)
-        self.num_heads = num_heads
-        self.dropout_prob = dropout_prob
+# class Attention(nn.Module):
+    # def __init__(self, C: int, num_heads:int , dropout_prob: float):
+        # super().__init__()
+        # self.proj1 = nn.Linear(C, C*3)
+        # self.proj2 = nn.Linear(C, C)
+        # self.num_heads = num_heads
+        # self.dropout_prob = dropout_prob
 
-    def forward(self, x):
-        h, w = x.shape[2:]
-        x = rearrange(x, 'b c h w -> b (h w) c')
-        x = self.proj1(x)
-        x = rearrange(x, 'b L (C H K) -> K b H L C', K=3, H=self.num_heads)
-        q,k,v = x[0], x[1], x[2]
-        x = F.scaled_dot_product_attention(q,k,v, is_causal=False, dropout_p=self.dropout_prob)
-        x = rearrange(x, 'b H (h w) C -> b h w (C H)', h=h, w=w)
-        x = self.proj2(x)
-        return rearrange(x, 'b h w C -> b C h w')
+    # def forward(self, x):
+        # h, w = x.shape[2:]
+        # x = rearrange(x, 'b c h w -> b (h w) c')
+        # x = self.proj1(x)
+        # x = rearrange(x, 'b L (C H K) -> K b H L C', K=3, H=self.num_heads)
+        # q,k,v = x[0], x[1], x[2]
+        # x = F.scaled_dot_product_attention(q,k,v, is_causal=False, dropout_p=self.dropout_prob)
+        # x = rearrange(x, 'b H (h w) C -> b h w (C H)', h=h, w=w)
+        # x = self.proj2(x)
+        # return rearrange(x, 'b h w C -> b C h w')
+
+# Cross attention block
+class CrossAttention(nn.Module):
+    def __init__(self, C, num_heads=8, dropout_prob=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(embed_dim=C, num_heads=num_heads, dropout=dropout_prob)
+        self.norm = nn.LayerNorm(C)
+
+    def forward(self, x, context):
+        # x: [B, C, H, W] → flatten spatial dims
+        B, C, H, W = x.shape
+        x_flat = x.view(B, C, -1).permute(2, 0, 1)  # [HW, B, C]
+        context = context.permute(1, 0, 2)  # [seq_len, B, C]
+        attn_out, _ = self.attn(x_flat, context, context)
+        out = self.norm(x_flat + attn_out)
+        out = out.permute(1, 2, 0).view(B, C, H, W)
+        return out
 
 class UnetLayer(nn.Module):
     def __init__(self, 
@@ -81,13 +98,15 @@ class UnetLayer(nn.Module):
             self.conv = nn.ConvTranspose2d(C, C//2, kernel_size=4, stride=2, padding=1)
         else:
             self.conv = nn.Conv2d(C, C*2, kernel_size=3, stride=2, padding=1)
-        if attention:
-            self.attention_layer = Attention(C, num_heads=num_heads, dropout_prob=dropout_prob)
-
-    def forward(self, x, embeddings):
+        # if attention:
+            # removing self attention and intead using cross attention for context between images and text
+            # self.attention_layer = Attention(C, num_heads=num_heads, dropout_prob=dropout_prob)
+        self.cross_attention_layer = CrossAttention(C, num_heads=num_heads, dropout_prob=dropout_prob)
+    
+    def forward(self, x, embeddings, text_emb=text_emb):
         x = self.ResBlock1(x, embeddings)
-        if hasattr(self, 'attention_layer'):
-            x = self.attention_layer(x)
+        if hasattr(self, 'attention_layer') and text_emb is not None:
+            x = self.cross_attention_layer(x, context=text_emb) # cross-attention
         x = self.ResBlock2(x, embeddings)
         return self.conv(x), x
 
@@ -121,17 +140,18 @@ class UNET(nn.Module):
             )
             setattr(self, f'Layer{i+1}', layer)
 
-    def forward(self, x, t):
+    def forward(self, x, t, text_emb=None):
         x = self.shallow_conv(x)
         residuals = []
         for i in range(self.num_layers//2):
             layer = getattr(self, f'Layer{i+1}')
             embeddings = self.embeddings(x, t)
-            x, r = layer(x, embeddings)
+            x, r = layer(x, embeddings, text_emb=text_emb)
             residuals.append(r)
         for i in range(self.num_layers//2, self.num_layers):
             layer = getattr(self, f'Layer{i+1}')
-            x = torch.concat((layer(x, embeddings)[0], residuals[self.num_layers-i-1]), dim=1)
+            x, _ = layer(x, embeddings, text_emb=text_emb)
+            x= torch.concat((layer(x, embeddings)[0], residuals[self.num_layers-i-1]), dim=1)
         return self.output_conv(self.relu(self.late_conv(x)))
 
 class DDPM_Scheduler(nn.Module):

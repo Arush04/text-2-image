@@ -1,7 +1,10 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 import random
 from modelClasses import *
+from transformers import CLIPTokenizer, CLIPTextModel
+
 
 def set_seed(seed: int = 42):
     torch.manual_seed(seed)
@@ -10,6 +13,11 @@ def set_seed(seed: int = 42):
     torch.backends.cudnn.benchmark = False
     np.random.seed(seed)
     random.seed(seed)
+
+def encode_text(prompts):
+    tokens = tokenizer(prompts, padding=True, truncation=True, return_tensors=".pt").to("cuda")
+    text_emb = text_encoder(**tokens).last_hidden_state
+    return text_emb
 
 def train(batch_size: int=64,
           num_time_steps: int=1000,
@@ -61,6 +69,9 @@ def train(batch_size: int=64,
     torch.save(checkpoint, 'checkpoints/ddpm_checkpoint')
 
 def main():
+    tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+    text_encoder = CLIPTextModel.from_pretrained("openai/clip-vit-base-patch32").cuda()
+
     train(checkpoint_path=None, lr=2e-5, num_epochs=75)
 
 if __name__ == '__main__':
