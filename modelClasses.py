@@ -14,70 +14,64 @@ import torch.optim as optim
 import numpy as np
 
 class SinusoidalEmbeddings(nn.Module):
-    def __init__(self, time_steps:int, embed_dim: int):
+    def __init__(self, time_steps: int, embed_dim: int):
         super().__init__()
-        # create discrete time steps indices of size (T,1)
         position = torch.arange(time_steps).unsqueeze(1).float()
         div = torch.exp(torch.arange(0, embed_dim, 2).float() * -(math.log(10000.0) / embed_dim))
         embeddings = torch.zeros(time_steps, embed_dim, requires_grad=False)
         embeddings[:, 0::2] = torch.sin(position * div)
         embeddings[:, 1::2] = torch.cos(position * div)
-        self.embeddings = embeddings
+        self.register_buffer("embeddings", embeddings)
 
     def forward(self, x, t):
-        embeds = self.embeddings[t].to(x.device)
+        C = x.shape[1]
+        embeds = self.embeddings[t, :C].to(x.device)  # match input channels dynamically
         return embeds[:, :, None, None]
+
 
 # Residual Blocks
 class ResBlock(nn.Module):
-    def __init__(self, C: int, num_groups: int, dropout_prob: float):
+    def __init__(self, num_groups: int, dropout_prob: float):
         super().__init__()
         self.relu = nn.ReLU(inplace=True)
-        self.gnorm1 = nn.GroupNorm(num_groups=num_groups, num_channels=C)
-        self.gnorm2 = nn.GroupNorm(num_groups=num_groups, num_channels=C)
-        self.conv1 = nn.Conv2d(C, C, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(C, C, kernel_size=3, padding=1)
-        self.dropout = nn.Dropout(p=dropout_prob, inplace=True)
+        self.num_groups = num_groups
+        self.dropout_prob = dropout_prob
+        self.conv1 = None  # will initialize in forward
+        self.conv2 = None
+        self.gnorm1 = None
+        self.gnorm2 = None
+        self.dropout = nn.Dropout(p=dropout_prob, inplace=False)
 
     def forward(self, x, embeddings):
-        x = x + embeddings[:, :x.shape[1], :, :]
+        C = x.shape[1]  # dynamic channels
+        if self.gnorm1 is None or self.conv1 is None:
+            self.gnorm1 = nn.GroupNorm(num_groups=min(self.num_groups, C), num_channels=C).to(x.device)
+            self.gnorm2 = nn.GroupNorm(num_groups=min(self.num_groups, C), num_channels=C).to(x.device)
+            self.conv1 = nn.Conv2d(C, C, kernel_size=3, padding=1).to(x.device)
+            self.conv2 = nn.Conv2d(C, C, kernel_size=3, padding=1).to(x.device)
+
+        x = x + embeddings[:, :C, :, :]
         r = self.conv1(self.relu(self.gnorm1(x)))
         r = self.dropout(r)
         r = self.conv2(self.relu(self.gnorm2(r)))
         return r + x
 
-# Attention Block
-# class Attention(nn.Module):
-    # def __init__(self, C: int, num_heads:int , dropout_prob: float):
-        # super().__init__()
-        # self.proj1 = nn.Linear(C, C*3)
-        # self.proj2 = nn.Linear(C, C)
-        # self.num_heads = num_heads
-        # self.dropout_prob = dropout_prob
-
-    # def forward(self, x):
-        # h, w = x.shape[2:]
-        # x = rearrange(x, 'b c h w -> b (h w) c')
-        # x = self.proj1(x)
-        # x = rearrange(x, 'b L (C H K) -> K b H L C', K=3, H=self.num_heads)
-        # q,k,v = x[0], x[1], x[2]
-        # x = F.scaled_dot_product_attention(q,k,v, is_causal=False, dropout_p=self.dropout_prob)
-        # x = rearrange(x, 'b H (h w) C -> b h w (C H)', h=h, w=w)
-        # x = self.proj2(x)
-        # return rearrange(x, 'b h w C -> b C h w')
 
 # Cross attention block
 class CrossAttention(nn.Module):
-    def __init__(self, C, num_heads=8, dropout_prob=0.1):
+    def __init__(self, C, text_dim=512, num_heads=8, dropout_prob=0.1):
         super().__init__()
+        self.proj = nn.Linear(text_dim, C)
         self.attn = nn.MultiheadAttention(embed_dim=C, num_heads=num_heads, dropout=dropout_prob)
         self.norm = nn.LayerNorm(C)
 
     def forward(self, x, context):
-        # x: [B, C, H, W] → flatten spatial dims
         B, C, H, W = x.shape
         x_flat = x.view(B, C, -1).permute(2, 0, 1)  # [HW, B, C]
-        context = context.permute(1, 0, 2)  # [seq_len, B, C]
+
+        context = self.proj(context)                # [B, seq_len, C]
+        context = context.permute(1, 0, 2)          # [seq_len, B, C]
+
         attn_out, _ = self.attn(x_flat, context, context)
         out = self.norm(x_flat + attn_out)
         out = out.permute(1, 2, 0).view(B, C, H, W)
@@ -85,27 +79,26 @@ class CrossAttention(nn.Module):
 
 class UnetLayer(nn.Module):
     def __init__(self, 
-            upscale: bool, 
-            attention: bool, 
-            num_groups: int, 
-            dropout_prob: float,
-            num_heads: int,
-            C: int):
+                 upscale: bool, 
+                 attention: bool, 
+                 num_groups: int, 
+                 dropout_prob: float,
+                 num_heads: int,
+                 C: int):
         super().__init__()
-        self.ResBlock1 = ResBlock(C=C, num_groups=num_groups, dropout_prob=dropout_prob)
-        self.ResBlock2 = ResBlock(C=C, num_groups=num_groups, dropout_prob=dropout_prob)
+        self.ResBlock1 = ResBlock(num_groups=num_groups, dropout_prob=dropout_prob)
+        self.ResBlock2 = ResBlock(num_groups=num_groups, dropout_prob=dropout_prob)
+
         if upscale:
             self.conv = nn.ConvTranspose2d(C, C//2, kernel_size=4, stride=2, padding=1)
         else:
             self.conv = nn.Conv2d(C, C*2, kernel_size=3, stride=2, padding=1)
-        # if attention:
-            # removing self attention and intead using cross attention for context between images and text
-            # self.attention_layer = Attention(C, num_heads=num_heads, dropout_prob=dropout_prob)
+
         self.cross_attention_layer = CrossAttention(C, num_heads=num_heads, dropout_prob=dropout_prob)
     
-    def forward(self, x, embeddings, text_emb=text_emb):
+    def forward(self, x, embeddings, text_emb=None):
         x = self.ResBlock1(x, embeddings)
-        if hasattr(self, 'attention_layer') and text_emb is not None:
+        if text_emb is not None:
             x = self.cross_attention_layer(x, context=text_emb) # cross-attention
         x = self.ResBlock2(x, embeddings)
         return self.conv(x), x
@@ -118,8 +111,8 @@ class UNET(nn.Module):
             num_groups: int = 32,
             dropout_prob: float = 0.1,
             num_heads: int = 8,
-            input_channels: int = 1,
-            output_channels: int = 1,
+            input_channels: int = 3,
+            output_channels: int = 3,
             time_steps: int = 1000):
         super().__init__()
         self.num_layers = len(Channels)
