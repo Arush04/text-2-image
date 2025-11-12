@@ -36,10 +36,10 @@ class ResBlock(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.num_groups = num_groups
         self.dropout_prob = dropout_prob
-        self.conv1 = None  # will initialize in forward
-        self.conv2 = None
-        self.gnorm1 = None
-        self.gnorm2 = None
+        self.gnorm1 = nn.GroupNorm(num_groups=min(self.num_groups, C), num_channels=C).to(x.device)
+        self.gnorm2 = nn.GroupNorm(num_groups=min(self.num_groups, C), num_channels=C).to(x.device)
+        self.conv1 = nn.Conv2d(C, C, kernel_size=3, padding=1).to(x.device)
+        self.conv2 = nn.Conv2d(C, C, kernel_size=3, padding=1).to(x.device)
         self.dropout = nn.Dropout(p=dropout_prob, inplace=False)
 
     def forward(self, x, embeddings):
