@@ -136,7 +136,7 @@ def train(
         os.makedirs("checkpoints", exist_ok=True)
     
         print("Gathering full model from DTensor shards...")
-        model_state = gather_state_dict(model)  # ✅ convert DTensor → full tensor
+        model_state = gather_state_dict(model)  # Convert DTensor → full tensor
     
         ckpt = {
             "weights": model_state,
