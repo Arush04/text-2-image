@@ -109,20 +109,68 @@ class UNET(nn.Module):
             Attentions: List = [False, True, False, False, False, True],
             Upscales: List = [False, False, False, True, True, True],
             num_groups: int = 32,
+            text_embed_dim: int = 512,
             dropout_prob: float = 0.1,
             num_heads: int = 8,
             input_channels: int = 3,
             output_channels: int = 3,
             time_steps: int = 1000):
         super().__init__()
+        
+        # Contants
+        ATTN_HEADS = 4
+        ATTN_DIM_HEAD = 64
+        NUM_TIME_TOKENS = 2
+        RESNET_GROUPS = 8
+
         self.num_layers = len(Channels)
-        self.shallow_conv = nn.Conv2d(input_channels, Channels[0], kernel_size=3, padding=1)
         out_channels = (Channels[-1]//2)+Channels[0]
-        self.late_conv = nn.Conv2d(out_channels, out_channels//2, kernel_size=3, padding=1)
-        self.output_conv = nn.Conv2d(out_channels//2, output_channels, kernel_size=1)
-        self.relu = nn.ReLU(inplace=True)
         self.embeddings = SinusoidalEmbeddings(time_steps=time_steps, embed_dim=max(Channels))
         for i in range(self.num_layers):
+            
+            dim = Channels[i]
+            # Time Conditioning
+            time_cond_dim = dim*4
+            
+            # Map time to time hidden state
+            self.to_time_hiddens = nn.Sequential(
+                embeddings,
+                nn.Linear(dim, time_cond_dim),
+                nn.SiLU()
+            )
+
+            # Map time hidden states to time conditioning (non-attention)
+            self.to_time_cond = nn.Sequential(
+                nn.Linear(time_cond_dim, time_cond_dim)
+            )
+            
+            # Map time hidden states to time time tokens for main conditioning tokens (attention)
+            self.to_time_tokens = nn.Sequential(
+                nn.Linear(time_cond_dim, dim*NUM_TIME_TOKENS),
+                rearrange('b (r d) -> b r d', r=NUM_TIME_TOKENS)
+            )
+            
+            # Text Conditioning
+            self.norm_cond = nn.LayerNorm(dim)
+
+            # Projection from text embedding dim to cond_dim
+            self.text_embed_dim = text_embed_dim
+            self.text_to_cond = nn.Linear(self.text_embed_dim, cond_dim)
+
+            # Create null tokens for classifier-free guidance. See
+            max_text_len = 256
+            self.max_text_len = max_text_len
+            self.null_text_embed = nn.Parameter(torch.randn(1, max_text_len, cond_dim))
+            self.null_text_hidden = nn.Parameter(torch.randn(1, time_cond_dim))
+
+            # For injecting text information into time conditioning (non-attention)
+            self.to_text_non_attn_cond = nn.Sequential(
+                nn.LayerNorm(cond_dim),
+                nn.Linear(cond_dim, time_cond_dim),
+                nn.SiLU(),
+                nn.Linear(time_cond_dim, time_cond_dim)
+            )
+
             layer = UnetLayer(
                 upscale=Upscales[i],
                 attention=Attentions[i],
