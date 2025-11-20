@@ -1,11 +1,59 @@
+import torch
 import random
+import torch.nn as nn
 import numpy as np
 from torchvision import transforms
 from torch.utils.data import IterableDataset
 from torch.distributed.checkpoint import state_dict as dist_state_dict
 from torch.distributed.checkpoint import load_state_dict as dist_load_state_dict
+import math
+
+class SinusoidalEmbeddings(nn.Module):
+    def __init__(self, time_steps: int, embed_dim: int):
+        super().__init__()
+        position = torch.arange(time_steps).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, embed_dim, 2).float() * -(math.log(10000.0) / embed_dim))
+        embeddings = torch.zeros(time_steps, embed_dim, requires_grad=False)
+        embeddings[:, 0::2] = torch.sin(position * div)
+        embeddings[:, 1::2] = torch.cos(position * div)
+        self.register_buffer("embeddings", embeddings)
+
+    def forward(self, x, t):
+        C = x.shape[1]
+        embeds = self.embeddings[t, :C].to(x.device)  # match input channels dynamically
+        return embeds[:, :, None, None]
+
+
+class DDPM_Scheduler(nn.Module):
+    def __init__(self, num_time_steps: int=1000):
+        super().__init__()
+        self.beta = torch.linspace(1e-4, 0.02, num_time_steps, requires_grad=False)
+        alpha = 1 - self.beta
+        self.alpha = torch.cumprod(alpha, dim=0).requires_grad_(False)
+
+    def forward(self, t):
+        return self.beta[t], self.alpha[t]
+
+def cast_tuple(val, length: int = None) -> tuple:
+    '''
+    Casts input to a tuple. If the input is a list, converts it to a tuple. If input a single value, casts it to a
+        tuple of length `length`, which is 1 if not provided.
+    '''
+    if isinstance(val, list):
+        val = tuple(val)
+    if length==None:
+        length=1
+    output = val if isinstance(val, tuple) else ((val,) * length)
+
+    if length!=None:
+        assert len(output) == length
+
+    return output
 
 def gather_state_dict(model):
+    """
+    The training occurs using FSDP, this function gathers the distributed state_dict and combines it to a single dict.
+    """
     try:
         full_state = {}
         dist_state = model.state_dict()
@@ -25,6 +73,8 @@ def gather_state_dict(model):
 # --------------------------
 # Dataset
 # --------------------------
+# TO-DO:
+# Right now the model is iterable and hence can't be shulffed, this might cause training bias, need to make it shuffable.
 class MyIterableDataset(torch.utils.data.IterableDataset):
     def __init__(self, dataset, rank, world_size, tokenizer, image_size=256):
         self.dataset = dataset

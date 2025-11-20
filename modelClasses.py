@@ -4,78 +4,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from typing import List
 import random
-import math
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader 
-from timm.utils import ModelEmaV3
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-import torch.optim as optim
-import numpy as np
-
-class SinusoidalEmbeddings(nn.Module):
-    def __init__(self, time_steps: int, embed_dim: int):
-        super().__init__()
-        position = torch.arange(time_steps).unsqueeze(1).float()
-        div = torch.exp(torch.arange(0, embed_dim, 2).float() * -(math.log(10000.0) / embed_dim))
-        embeddings = torch.zeros(time_steps, embed_dim, requires_grad=False)
-        embeddings[:, 0::2] = torch.sin(position * div)
-        embeddings[:, 1::2] = torch.cos(position * div)
-        self.register_buffer("embeddings", embeddings)
-
-    def forward(self, x, t):
-        C = x.shape[1]
-        embeds = self.embeddings[t, :C].to(x.device)  # match input channels dynamically
-        return embeds[:, :, None, None]
-
-
-# Residual Blocks
-class ResBlock(nn.Module):
-    def __init__(self, num_groups: int, dropout_prob: float):
-        super().__init__()
-        self.relu = nn.ReLU(inplace=True)
-        self.num_groups = num_groups
-        self.dropout_prob = dropout_prob
-        self.gnorm1 = nn.GroupNorm(num_groups=min(self.num_groups, C), num_channels=C).to(x.device)
-        self.gnorm2 = nn.GroupNorm(num_groups=min(self.num_groups, C), num_channels=C).to(x.device)
-        self.conv1 = nn.Conv2d(C, C, kernel_size=3, padding=1).to(x.device)
-        self.conv2 = nn.Conv2d(C, C, kernel_size=3, padding=1).to(x.device)
-        self.dropout = nn.Dropout(p=dropout_prob, inplace=False)
-
-    def forward(self, x, embeddings):
-        C = x.shape[1]  # dynamic channels
-        if self.gnorm1 is None or self.conv1 is None:
-            self.gnorm1 = nn.GroupNorm(num_groups=min(self.num_groups, C), num_channels=C).to(x.device)
-            self.gnorm2 = nn.GroupNorm(num_groups=min(self.num_groups, C), num_channels=C).to(x.device)
-            self.conv1 = nn.Conv2d(C, C, kernel_size=3, padding=1).to(x.device)
-            self.conv2 = nn.Conv2d(C, C, kernel_size=3, padding=1).to(x.device)
-
-        x = x + embeddings[:, :C, :, :]
-        r = self.conv1(self.relu(self.gnorm1(x)))
-        r = self.dropout(r)
-        r = self.conv2(self.relu(self.gnorm2(r)))
-        return r + x
-
-
-# Cross attention block
-class CrossAttention(nn.Module):
-    def __init__(self, C, text_dim=512, num_heads=8, dropout_prob=0.1):
-        super().__init__()
-        self.proj = nn.Linear(text_dim, C)
-        self.attn = nn.MultiheadAttention(embed_dim=C, num_heads=num_heads, dropout=dropout_prob)
-        self.norm = nn.LayerNorm(C)
-
-    def forward(self, x, context):
-        B, C, H, W = x.shape
-        x_flat = x.view(B, C, -1).permute(2, 0, 1)  # [HW, B, C]
-
-        context = self.proj(context)                # [B, seq_len, C]
-        context = context.permute(1, 0, 2)          # [seq_len, B, C]
-
-        attn_out, _ = self.attn(x_flat, context, context)
-        out = self.norm(x_flat + attn_out)
-        out = out.permute(1, 2, 0).view(B, C, H, W)
-        return out
+from layers import CrossEmbedLayer 
+from utils import cast_tuple
 
 class UnetLayer(nn.Module):
     def __init__(self, 
@@ -105,24 +35,110 @@ class UnetLayer(nn.Module):
 
 class UNET(nn.Module):
     def __init__(self,
-            Channels: List = [64, 128, 256, 512, 512, 384],
-            Attentions: List = [False, True, False, False, False, True],
-            Upscales: List = [False, False, False, True, True, True],
+            Channels: List = [64, 128, 256, 512],
+            attentions: List = [False, True, False, False, False, True, False, True],
+            cross_attention: List = [True, False, True, True, True, False, True, False],
+            # Upscales: List = [False, False, False, True, True, True],
+            num_resnet_blocks = 1,
             num_groups: int = 32,
+            text_embed_dim: int = 512,
             dropout_prob: float = 0.1,
             num_heads: int = 8,
             input_channels: int = 3,
             output_channels: int = 3,
             time_steps: int = 1000):
         super().__init__()
+        
+        # Contants
+        ATTN_HEADS = 4
+        ATTN_DIM_HEAD = 64
+        NUM_TIME_TOKENS = 2
+        RESNET_GROUPS = 8
+
         self.num_layers = len(Channels)
-        self.shallow_conv = nn.Conv2d(input_channels, Channels[0], kernel_size=3, padding=1)
         out_channels = (Channels[-1]//2)+Channels[0]
-        self.late_conv = nn.Conv2d(out_channels, out_channels//2, kernel_size=3, padding=1)
-        self.output_conv = nn.Conv2d(out_channels//2, output_channels, kernel_size=1)
-        self.relu = nn.ReLU(inplace=True)
         self.embeddings = SinusoidalEmbeddings(time_steps=time_steps, embed_dim=max(Channels))
         for i in range(self.num_layers):
+            
+            dim = Channels[i]
+            # Time Conditioning
+            time_cond_dim = dim*4
+            
+            # Map time to time hidden state
+            self.to_time_hiddens = nn.Sequential(
+                embeddings,
+                nn.Linear(dim, time_cond_dim),
+                nn.SiLU()
+            )
+
+            # Map time hidden states to time conditioning (non-attention)
+            self.to_time_cond = nn.Sequential(
+                nn.Linear(time_cond_dim, time_cond_dim)
+            )
+            
+            # Map time hidden states to time time tokens for main conditioning tokens (attention)
+            self.to_time_tokens = nn.Sequential(
+                nn.Linear(time_cond_dim, dim*NUM_TIME_TOKENS),
+                rearrange('b (r d) -> b r d', r=NUM_TIME_TOKENS)
+            )
+            
+            # Text Conditioning
+            self.norm_cond = nn.LayerNorm(dim)
+
+            # Projection from text embedding dim to cond_dim
+            self.text_embed_dim = text_embed_dim
+            self.text_to_cond = nn.Linear(self.text_embed_dim, cond_dim)
+
+            # Create null tokens for classifier-free guidance. See
+            max_text_len = 256
+            self.max_text_len = max_text_len
+            self.null_text_embed = nn.Parameter(torch.randn(1, max_text_len, cond_dim))
+            self.null_text_hidden = nn.Parameter(torch.randn(1, time_cond_dim))
+
+            # For injecting text information into time conditioning (non-attention)
+            self.to_text_non_attn_cond = nn.Sequential(
+                nn.LayerNorm(cond_dim),
+                nn.Linear(cond_dim, time_cond_dim),
+                nn.SiLU(),
+                nn.Linear(time_cond_dim, time_cond_dim)
+            )
+            # Initial convolution that brings input images to proper number of channels for the Unet
+            self.init_conv = CrossEmbedLayer(channels if not lowres_cond else channels * 2,
+                             dim_out=dim,
+                             kernel_sizes=(2, 6, 12),
+                             stride=2)
+            
+            dims = [Channels[0], *Channels]
+            # in/out pair based on the proivded Channel sizes
+            in_out = list(zip(dims[:-1], dims[1:]))
+            # Number of resolutions/layers in the UNet
+            num_resolutions = len(in_out)
+            
+            num_resnet_blocks = cast_tuple(num_resnet_blocks, num_resolutions)
+            resnet_groups = cast_tuple(RESNET_GROUPS, num_resolutions)
+            layer_attns = cast_tuple(attentions[i], num_resolutions)
+            layer_cross_attns = cast_tuple(cross_attention[i], num_resolutions)
+
+            # Make sure relevant tuples have one elt for each layer in the UNet (if tuples rather than single values passed
+            #   in as arguments)
+            assert all(
+                [layers == num_resolutions for layers in list(map(len, (resnet_groups, layer_attns, layer_cross_attns)))])
+
+            # Scale for resnet skip connections
+            self.skip_connect_scale = 2 ** -0.5
+
+            # Downsampling and Upsampling modules of the Unet
+            self.downs = nn.ModuleList([])
+            self.ups = nn.ModuleList([])
+
+            # Parameter lists for downsampling and upsampling trajectories
+            layer_params = [num_resnet_blocks, resnet_groups, layer_attns, layer_cross_attns]
+            reversed_layer_params = list(map(reversed, layer_params))
+            
+            # Downsampling Layers
+            #Keep track of skip connections channels depth
+            skip_connection_dims = []
+            
             layer = UnetLayer(
                 upscale=Upscales[i],
                 attention=Attentions[i],
@@ -147,12 +163,3 @@ class UNET(nn.Module):
             x= torch.concat((layer(x, embeddings)[0], residuals[self.num_layers-i-1]), dim=1)
         return self.output_conv(self.relu(self.late_conv(x)))
 
-class DDPM_Scheduler(nn.Module):
-    def __init__(self, num_time_steps: int=1000):
-        super().__init__()
-        self.beta = torch.linspace(1e-4, 0.02, num_time_steps, requires_grad=False)
-        alpha = 1 - self.beta
-        self.alpha = torch.cumprod(alpha, dim=0).requires_grad_(False)
-
-    def forward(self, t):
-        return self.beta[t], self.alpha[t]

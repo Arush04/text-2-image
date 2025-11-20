@@ -1,3 +1,7 @@
+numpy
 timm
 tqdm
 matplotlib
+torch
+torchvision
+einops
