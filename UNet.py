@@ -1,7 +1,15 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+from einops import rearrange
+from einops.layers.torch import Rearrange
+from .layers import (
+        SinsiodalPosEmb,
+        CrossEmbedLayer
+    )
+from utils import (
+        cast_tuple
+    )
 
 # Residual Blocks
 class ResBlock(nn.Module):
@@ -128,3 +136,61 @@ class Unet(nn.Module):
         # Double conditioning dimensionality for super-res models due to concatenation of low-res images
         cond_dim = default(cond_dim, dim)
         time_cond_dim = dim * 4 * (2 if lowres_cond else 1)
+        
+        # Maps time hidden state to time conditioning (non-attention)
+        # Global time conditioning gets applied to all layers in the network
+        self.to_time_cond = nn.Sequential(
+            nn.Linear(time_cond_dim, time_cond_dim)
+        )
+
+        # Maps time hidden states to time tokens for main conditioning tokens (attention)
+        # produces NUM_TIME_TOKENS seperate token embeddings that participate in cross-attention mechanism
+        self.to_time_tokens = nn.Sequential(
+            nn.Linear(time_cond_dim, cond_dim * NUM_TIME_TOKENS),
+            Rearrange('b (r d) -> b r d', r=NUM_TIME_TOKENS)
+        )
+
+        # TEXT CONDITIONING
+        self.norm_cond = nn.LayerNorm(cond_dim)
+
+        # Projection from text embedding dim to cond_dim
+        self.text_embed_dim = text_embed_dim
+        self.text_to_cond = nn.Linear(self.text_embed_dim, cond_dim)
+
+        max_text_len = 256
+        self.max_text_len = max_text_len
+        self.null_text_embed = nn.Parameter(torch.randn(1, max_text_len, cond_dim))
+        self.null_text_hidden = nn.Parameter(torch.randn(1, time_cond_dim))
+
+        # For injecting text information into time conditioning (non-attention)
+        self.to_text_non_attn_cond = nn.Sequential(
+            nn.LayerNorm(cond_dim),
+            nn.Linear(cond_dim, time_cond_dim),
+            nn.SiLU(),
+            nn.Linear(time_cond_dim, time_cond_dim)
+        )
+
+        # UNET LAYERS
+
+        self.channels = channels
+        self.channels_out = default(channels_out, channels)
+
+        # Initial convolution that brings input images to proper number of channels for the Unet
+        self.init_conv = CrossEmbedLayer(channels if not lowres_cond else channels * 2,
+                                         dim_out=dim,
+                                         kernel_sizes=(3, 7, 15),
+                                         stride=1)
+
+        # Determine channel numbers for UNet descent/ascent and then zip into in/out pairs
+        dims = [dim, *map(lambda m: dim * m, dim_mults)]
+        in_out = list(zip(dims[:-1], dims[1:]))
+
+        # Number of resolutions/layers in the UNet
+        num_resolutions = len(in_out)
+
+        # Cast relevant arguments to tuples (with one element for each Unet layer) if a single value rather than tuple
+        #   was input for the argument
+        num_resnet_blocks = cast_tuple(num_resnet_blocks, num_resolutions)
+        resnet_groups = cast_tuple(RESNET_GROUPS, num_resolutions)
+        layer_attns = cast_tuple(layer_attns, num_resolutions)
+        layer_cross_attns = cast_tuple(layer_cross_attns, num_resolutions)

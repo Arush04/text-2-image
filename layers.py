@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-
+import math
+from einops import rearrange
 
 # Residual Blocks
 class ResBlock(nn.Module):
@@ -55,7 +56,7 @@ class CrossEmbedLayer(nn.Module):
     '''
     Module that performs cross embedding on an input image (essentially an Inception module) which maintains channel
         depth.
-
+    Essentially we are running multiple kernels of differente sizes on the same input to get more information.
     E.g. If input a 64x64 image with 128 channels and use kernel_sizes = (3, 7, 15) and stride=1, then 3 convolutions
         will be performed:
 
@@ -74,10 +75,11 @@ class CrossEmbedLayer(nn.Module):
             stride: int = 2
     ):
         """
-        :param dim_in: Number of channels in the input image.
-        :param kernel_sizes: Tuple of kernel sizes to use for convolutions.
-        :param dim_out: Number of channels in output image. Defaults to `dim_in`.
-        :param stride: Stride of convolutions.
+        params:
+        dim_in: Number of channels in the input image.
+        kernel_sizes: Tuple of kernel sizes to use for convolutions.
+        dim_out: Number of channels in output image. Defaults to `dim_in`.
+        stride: Stride of convolutions.
         """
         super().__init__()
         # Ensures stride and all kernels are either all odd or all even
@@ -90,7 +92,7 @@ class CrossEmbedLayer(nn.Module):
         kernel_sizes = sorted(kernel_sizes)
         num_scales = len(kernel_sizes)
 
-        # Determine number of filters for each kernel. They will sum to dim_out and be descending with kernel size
+        # The following code determines the number of filters for each kernel and the sum of filters of each kernel = dim_out and list in descending order
         dim_scales = [int(dim_out / (2 ** i)) for i in range(1, num_scales)]
         dim_scales = [*dim_scales, dim_out - sum(dim_scales)]
 
@@ -104,3 +106,17 @@ class CrossEmbedLayer(nn.Module):
         fmaps = tuple(map(lambda conv: conv(x), self.convs))
         return torch.cat(fmaps, dim=1)
 
+class SinsiodalPosEmb(nn.Module):
+    """
+    Generates sinusiodal postional embedding tensor, here position corresponds to time. For more on sinusiodal postional embeddings refere here: https://stats.stackexchange.com/questions/409629/what-is-the-intuition-behind-the-positional-cosine-encoding-in-the-transformer-n/409635#409635?newreg=f7b48e085190413ab4933bb6a9301019
+    """
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1) # 10000 here is for scale as done in DDPM scheduler
+        emb = torch.exp(torch.arange(half_dim, device=x.device) * -emb)
+        emb = rearrange(x, 'i -> i 1') * rearrange(emb, 'j -> 1 j')
+        return torch.cat((emb.sin(), emb.cos()), dim=-1)
