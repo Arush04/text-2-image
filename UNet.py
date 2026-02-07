@@ -189,8 +189,81 @@ class Unet(nn.Module):
         num_resolutions = len(in_out)
 
         # Cast relevant arguments to tuples (with one element for each Unet layer) if a single value rather than tuple
-        #   was input for the argument
+        # was input for the argument
         num_resnet_blocks = cast_tuple(num_resnet_blocks, num_resolutions)
         resnet_groups = cast_tuple(RESNET_GROUPS, num_resolutions)
         layer_attns = cast_tuple(layer_attns, num_resolutions)
         layer_cross_attns = cast_tuple(layer_cross_attns, num_resolutions)
+        
+       
+        # Validate that per-resolution configuration tuples have one value per UNet resolution level
+        assert all(
+                    [layers == num_resolutions for layers in list(map(len, (resnet_groups, layer_attns, layer_cross_attns)))])
+        
+        # Scale for resnet skip connections
+        self.skip_connect_scale = 2 ** -0.5
+
+        # Downsampling and Upsampling modules of the Unet
+        self.downs = nn.ModuleList([])
+        self.ups = nn.ModuleList([])
+
+        # Parameter lists for downsampling and upsampling trajectories
+        layer_params = [num_resnet_blocks, resnet_groups, layer_attns, layer_cross_attns]
+        reversed_layer_params = list(map(reversed, layer_params))
+
+        # DOWNSAMPLING LAYERS
+
+        # Keep track of skip connection channel depths for concatenation later
+        skip_connect_dims = []
+        for ind, ((dim_in, dim_out), layer_num_resnet_blocks, groups, layer_attn, layer_cross_attn) in enumerate(
+                zip(in_out, *layer_params)):
+
+            is_last = ind == (num_resolutions - 1)
+
+            layer_cond_dim = cond_dim if layer_cross_attn else None
+
+            # Potentially use Transformer encoder at end of layer
+            transformer_block_klass = TransformerBlock if layer_attn else Identity
+
+            current_dim = dim_in
+
+            # Whether to downsample at the beginning of the layer - cuts image spatial size-length
+            pre_downsample = None
+            if memory_efficient:
+                pre_downsample = Downsample(dim_in, dim_out)
+                current_dim = dim_out
+
+            skip_connect_dims.append(current_dim)
+
+            # Downsample at the end of the layer if not `pre_downsample`
+            post_downsample = None
+            if not memory_efficient:
+                post_downsample = Downsample(current_dim, dim_out) if not is_last else Parallel(
+                    nn.Conv2d(dim_in, dim_out, 3, padding=1), nn.Conv2d(dim_in, dim_out, 1))
+
+            # Create the layer
+            self.downs.append(nn.ModuleList([
+                pre_downsample,
+                # ResnetBlock that conditions, in addition to time, on the main tokens via cross attention.
+                ResnetBlock(current_dim,
+                            current_dim,
+                            cond_dim=layer_cond_dim,
+                            time_cond_dim=time_cond_dim,
+                            groups=groups),
+                # Sequence of ResnetBlocks that condition only on time
+                nn.ModuleList(
+                    [
+                        ResnetBlock(current_dim,
+                                    current_dim,
+                                    time_cond_dim=time_cond_dim,
+                                    groups=groups
+                                    )
+                        for _ in range(layer_num_resnet_blocks)
+                    ]
+                ),
+                # Transformer encoder for multi-headed self attention
+                transformer_block_klass(dim=current_dim,
+                                        heads=attn_heads,
+                                        dim_head=ATTN_DIM_HEAD),
+                post_downsample,
+            ]))
